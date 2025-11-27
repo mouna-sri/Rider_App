@@ -7,7 +7,7 @@ const cloudinary = require("cloudinary").v2;
 const fs = require("fs");
 const dotenv = require("dotenv");
 
-// Load env from multiple possible locations
+// Load env
 dotenv.config();
 const envCandidates = [
   path.resolve(__dirname, "../.env.local"),
@@ -16,31 +16,55 @@ const envCandidates = [
   path.resolve(__dirname, "../../.env"),
 ];
 for (const p of envCandidates) {
-  try {
-    if (fs.existsSync(p)) {
-      dotenv.config({ path: p });
-    }
-  } catch {}
+  if (fs.existsSync(p)) dotenv.config({ path: p });
 }
 
-// Configure Cloudinary
+// Cloudinary
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
+// Init express/socket server
 const app = express();
 const http = require("http");
 const { Server } = require("socket.io");
 const server = http.createServer(app);
 
-// Fail fast for Mongoose
-mongoose.set("bufferCommands", false);
+// ================================
+//  CORS FIX (MAIN FIX)
+// ================================
+const allowedOrigins = [
+  "http://localhost:3000",
+  "http://15.206.239.81:3000" // <-- YOUR FRONTEND
+];
 
-// Socket.IO setup
+const corsOptions = {
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    console.log("❌ CORS BLOCKED:", origin);
+    return callback(new Error("Not allowed by CORS"));
+  },
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
+// ================================
+//  SOCKET.IO FIX (MATCH FRONTEND)
+// ================================
 const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] },
+  cors: {
+    origin: allowedOrigins,
+    methods: ["GET", "POST"],
+    credentials: true
+  }
 });
 
 app.set("io", io);
@@ -49,54 +73,37 @@ io.on("connection", (socket) => {
   console.log("✅ Socket connected:", socket.id);
 
   socket.on("join", (userId) => {
-    console.log(`📌 User joined room: ${userId}`);
     socket.join(userId);
   });
 
   socket.on("registerRiderVehicleType", (vehicleType) => {
-    const vType = String(vehicleType || "").trim().toLowerCase();
-    if (vType) {
-      const roomName = `vehicle:${vType}`;
-      socket.join(roomName);
-      console.log(`🚗 Rider joined vehicle room: ${roomName} (socket: ${socket.id})`);
-    }
+    const roomName = `vehicle:${String(vehicleType || "").trim().toLowerCase()}`;
+    socket.join(roomName);
   });
 
   socket.on("joinRideRoom", (rideId) => {
-    try {
-      if (!rideId) return;
-      const room = `ride:${rideId}`;
-      socket.join(room);
-      console.log(`💬 Joined ride room: ${room}`);
-    } catch (e) {
-      console.warn("joinRideRoom warning:", e?.message || e);
-    }
+    if (rideId) socket.join(`ride:${rideId}`);
   });
 
   socket.on("chatMessage", ({ rideId, fromUserId, text }) => {
-    try {
-      if (!rideId || !text) return;
-      const room = `ride:${rideId}`;
-      const payload = { rideId, fromUserId, text, at: Date.now() };
-      io.to(room).emit("chatMessage", payload);
-      console.log(`💬 Chat in ${room}:`, text);
-    } catch (e) {
-      console.warn("chatMessage relay warning:", e?.message || e);
-    }
+    if (!rideId || !text) return;
+    io.to(`ride:${rideId}`).emit("chatMessage", {
+      rideId,
+      fromUserId,
+      text,
+      at: Date.now()
+    });
   });
 
   socket.on("riderAccepted", (ride) => {
-    console.log("🚖 Rider accepted ride:", ride._id);
     io.to(ride.riderId.toString()).emit("rideAccepted", ride);
   });
 
   socket.on("riderRejected", (ride) => {
-    console.log("❌ Ride rejected:", ride._id);
     io.to(ride.riderId.toString()).emit("rideRejected", ride);
   });
 
   socket.on("riderLocation", ({ rideId, coords }) => {
-    console.log(`📍 Rider location update for ride ${rideId}:`, coords);
     io.emit("riderLocationUpdate", { rideId, coords });
   });
 
@@ -105,73 +112,37 @@ io.on("connection", (socket) => {
   });
 });
 
-// --- CORS Setup ---
-const allowedOrigins = [
-  "http://localhost:3000",        // React dev
-  "https://yourdomain.com",       // Deployed site
-  "https://www.yourdomain.com"
-];
-
-app.use(cors({
-  origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl)
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    return callback(new Error("Not allowed by CORS"));
-  },
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
-}));
-
-// Allow pre-flight for all routes
-app.options("*", cors({
-  origin: function (origin, callback) {
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    return callback(new Error("Not allowed by CORS"));
-  },
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
-}));
-
+// =====================================
 // Middleware
+// =====================================
 app.use(express.json({ limit: "10mb" }));
 
-// Raw body for webhook route
+// Webhook raw body
 app.use('/api/payments/webhook', express.raw({ type: 'application/json' }));
-// JSON parser for all other routes
 app.use((req, res, next) => {
   if (req.originalUrl === '/api/payments/webhook') return next();
   return express.json({ limit: '10mb' })(req, res, next);
 });
 
-// Normalize multiple slashes in URL
+// Normalize // in URL
 app.use((req, _res, next) => {
-  try {
-    req.url = req.url.replace(/\/{2,}/g, '/');
-  } catch {}
+  req.url = req.url.replace(/\/{2,}/g, '/');
   next();
 });
 
-// Request logger
+// Logger
 app.use((req, res, next) => {
-  console.log(
-    `[${new Date().toISOString()}] ➡️ ${req.method} ${req.originalUrl} | Body:`,
-    req.body
-  );
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
   next();
 });
 
-// MongoDB connection (with in-memory fallback)
+// =====================================
+// MongoDB Connection
+// =====================================
 async function connectDatabase() {
   const opts = { useNewUrlParser: true, useUnifiedTopology: true, serverSelectionTimeoutMS: 5000 };
   const uri = process.env.MONGO_URI;
+
   let connected = false;
   try {
     if (uri) {
@@ -182,61 +153,44 @@ async function connectDatabase() {
       throw new Error("MONGO_URI missing");
     }
   } catch (err) {
-    console.warn("⚠️ MongoDB connect failed:", err.message);
-    console.warn("➡️ Starting in-memory MongoDB for development");
+    console.warn("⚠️ MongoDB failed:", err.message);
+    console.warn("➡️ Starting In-Memory MongoDB...");
+
     try {
       const mongod = await MongoMemoryServer.create();
-      const memUri = mongod.getUri();
-      await mongoose.connect(memUri, opts);
+      await mongoose.connect(mongod.getUri(), opts);
       connected = true;
       console.log("✅ In-memory MongoDB started");
-      process.on("SIGINT", async () => {
-        try { await mongod.stop(); } catch {}
-        process.exit(0);
-      });
-    } catch (memErr) {
-      console.warn("⚠️ In-memory MongoDB failed:", memErr.message);
-      console.warn("➡️ Continuing in DB-offline mode; controllers have safe fallbacks.");
+    } catch (e) {
+      console.warn("❌ In-memory MongoDB failed:", e.message);
     }
   }
 
   app.set("dbOnline", connected);
 
-  if (!connected) {
-    return;
-  }
-
-  const User = require("./models/User");
-  const Ride = require("./models/Ride");
-  const Vehicle = require("./models/Vehicle");
-  const Payment = require("./models/Payment");
-  const Otp = require("./models/Otp");
-  const Parcel = require("./models/Parcel");
-
-  try {
+  if (connected) {
     const models = [
-      { model: User, name: "User" },
-      { model: Ride, name: "Ride" },
-      { model: Vehicle, name: "Vehicle" },
-      { model: Payment, name: "Payment" },
-      { model: Otp, name: "Otp" },
-      { model: Parcel, name: "Parcel" },
+      require("./models/User"),
+      require("./models/Ride"),
+      require("./models/Vehicle"),
+      require("./models/Payment"),
+      require("./models/Otp"),
+      require("./models/Parcel")
     ];
-    for (const { model, name } of models) {
-      if (mongoose.connection.readyState === 1 && model && model.createCollection) {
-        await model.createCollection();
-        console.log(`✅ ${name} collection ensured`);
-      }
+
+    for (const Model of models) {
+      if (Model?.createCollection) await Model.createCollection();
     }
-    console.log("✅ All collections checked/created");
-  } catch (err) {
-    console.warn("⚠️ Error ensuring collections:", err.message);
+
+    console.log("✅ Collections ensured");
   }
 }
 
-connectDatabase().catch((e) => console.error("❌ DB init error:", e));
+connectDatabase();
 
+// =====================================
 // Routes
+// =====================================
 app.use("/api/auth", require("./routes/authRoutes"));
 app.use("/api/otp", require("./routes/otpRoutes"));
 app.use("/api/rides", require("./routes/rides.routes"));
@@ -250,44 +204,30 @@ app.use("/api/wallet", require("./routes/wallet.routes"));
 
 app.use("/uploads", express.static("uploads"));
 
-// Protected route example
-const authMiddleware = require("./middleware/authMiddleware");
-app.get("/api/protected", authMiddleware, (req, res) => {
-  res.json({
-    success: true,
-    message: `Hello ${req.user.fullName || "User"}!`,
-    role: req.user.role,
-  });
-});
-
-// Serve React Frontend if build exists
+// =====================================
+// Serve React Build
+// =====================================
 const frontendPath = path.resolve(__dirname, "../../frontend/build");
+
 if (fs.existsSync(frontendPath)) {
   app.use(express.static(frontendPath));
   app.get("*", (req, res) => {
     if (req.url.startsWith("/api")) {
-      return res
-        .status(404)
-        .json({ success: false, message: "API route not found" });
+      return res.status(404).json({ success: false, message: "API route not found" });
     }
     res.sendFile(path.join(frontendPath, "index.html"));
   });
-} else {
-  // Without a build
-  app.get("*", (req, res) => {
-    if (req.url.startsWith("/api")) {
-      return res
-        .status(404)
-        .json({ success: false, message: "API route not found" });
-    }
-    res.status(404).send("Frontend build not found");
-  });
 }
 
-// Start server
+// =====================================
+// Start Server
+// =====================================
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+
+// IMPORTANT FIX: LISTEN ON PUBLIC IP
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Server running on http://0.0.0.0:${PORT}`);
 });
 
 module.exports = app;
+
